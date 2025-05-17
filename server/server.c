@@ -5,7 +5,7 @@
 #include <stdlib.h>
 #include <getopt.h>
 #include <sys/select.h>
-#include <sqlite3.h>
+#include "sqlite3.h"
 
 int db_init()
 {
