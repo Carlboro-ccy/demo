@@ -75,27 +75,90 @@ int getoption(int argc, char **argv, struct sockaddr_in *addr, int *time)
 int socket_connect(struct sockaddr_in serveraddr)
 {
   int fd = -1;
-  int flag = -1;
+  int flags = -1;
   if ((fd = socket(AF_INET, SOCK_STREAM, 0)) == -1)
   {
     perror("socket failure");
     return -1;
   }
-  flag = fcntl(fd, F_GETFL, 0);
-  if (flag == -1)
+
+  // Get current flags
+  flags = fcntl(fd, F_GETFL, 0);
+  if (flags == -1)
   {
-    perror("fcntl failed");
+    perror("fcntl F_GETFL failed");
     close(fd);
     return -1;
   }
-/*  if (connect(fd, (struct sockaddr *)&serveraddr, sizeof(serveraddr)))
+
+  // Set non-blocking
+  if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1)
+  {
+    perror("fcntl F_SETFL O_NONBLOCK failed");
+    close(fd);
+    return -1;
+  }
+
+  int ret = connect(fd, (struct sockaddr *)&serveraddr, sizeof(serveraddr));
+  if (ret == 0)
+  {
+    // Connection successful immediately
+    // Restore blocking mode
+    if (fcntl(fd, F_SETFL, flags) == -1)
+    {
+      perror("fcntl F_SETFL failed");
+      close(fd);
+      return -1;
+    }
+    return fd;
+  }
+  else if (errno == EINPROGRESS)
+  {
+    // Connection is in progress
+    // Restore blocking mode before returning -1 (as per user request to not close fd)
+    // Note: The prompt says "但不关闭fd" for EINPROGRESS and "在函数最后应改回阻塞socket"
+    // This implies even for EINPROGRESS, we should try to set it back to blocking.
+    // However, typically for EINPROGRESS, you'd keep it non-blocking and use select/poll/epoll.
+    // Given the specific instructions, I will set it back to blocking.
+    if (fcntl(fd, F_SETFL, flags) == -1) {
+        perror("fcntl F_SETFL failed while EINPROGRESS");
+        // If fcntl fails here, it's tricky. The socket is in an indeterminate state.
+        // Closing it might be safer, but the user said not to close on EINPROGRESS.
+        // For now, let's proceed as if fcntl succeeded, but this is a potential issue.
+    }
+    return -1; // Indicate connection in progress, fd not closed
+  }
+  else if (errno == EISCONN)
+  {
+    // Already connected (should not happen with a new socket, but handle defensively)
+    // Restore blocking mode
+    if (fcntl(fd, F_SETFL, flags) == -1)
+    {
+      perror("fcntl F_SETFL failed");
+      close(fd);
+      return -1;
+    }
+    return fd;
+  }
+  else
+  {
+    // Other connect error
+    perror("connect failed");
+    close(fd);
+    return -1;
+  }
+  // This part of the original code is now integrated above.
+  // The final fcntl to restore blocking mode is handled in each success/EINPROGRESS path.
+}
+
+/*
+  if (connect(fd, (struct sockaddr *)&serveraddr, sizeof(serveraddr)))
   {
     perror("connect failed");
     close(fd);
     return -1;
   }
   return fd;
-*/
   if (fcntl(fd, F_SETFL, flag | O_NONBLOCK) == -1)
   {
     perror("fcntl failed");
@@ -118,6 +181,7 @@ int socket_connect(struct sockaddr_in serveraddr)
   }
   
 }
+*/
 
 void get_data(char *buffer, size_t size)
 {
