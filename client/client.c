@@ -12,7 +12,8 @@
 #include <errno.h>
 #include <bits/getopt_core.h>
 #include <linux/time.h>
-#include "../../sqlite3.h"
+
+#include "sqlite3.h"
 
 sqlite3 *db = NULL;
 const char *db_file = "client_local_data.db";
