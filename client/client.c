@@ -12,53 +12,207 @@
 #include <errno.h>
 #include <bits/getopt_core.h>
 #include <linux/time.h>
+#include "../../sqlite3.h" // Added SQLite header
+
+// Global SQLite database handle
+sqlite3 *db = NULL;
+const char *db_file = "client_local_data.db";
 
 void sockaddr_init(struct sockaddr_in *addr)
 {
-  memset(addr, 0, sizeof(addr));
+  memset(addr, 0, sizeof(addr)); // Should be sizeof(*addr)
   addr->sin_family = AF_INET;
-  addr->sin_port = htons(0);
-  addr->sin_addr.s_addr = inet_addr("127.0.0.1");
+  addr->sin_port = htons(0); // Default port, can be overridden by -p
+  addr->sin_addr.s_addr = inet_addr("127.0.0.1"); // Default address, can be overridden by -a
 }
 
 int is_connected(int fd)
 {
   char buf[1] = {0};
-  ssize_t rv = -1;
-  if ((rv = recv(fd, buf, 1, MSG_PEEK | MSG_DONTWAIT)) == -1 && errno != EAGAIN && errno != EWOULDBLOCK)
+  if (recv(fd, buf, 1, MSG_PEEK | MSG_DONTWAIT) == -1 && errno != EAGAIN && errno != EWOULDBLOCK)
   {
-    printf("socket is closed\n");
+    perror("is_connected (recv)");
     return 0;
   }
   if (send(fd, NULL, 0, MSG_NOSIGNAL | MSG_DONTWAIT) == -1 && errno != EAGAIN && errno != EWOULDBLOCK)
   {
-    printf("socket is closed\n");
+    perror("is_connected (send)");
     return 0;
   }
   return 1;
 }
 
-void error_exit()
+// Modified error_exit to take a message
+void error_exit(const char *msg)
 {
+  perror(msg);
+  if (db) {
+    sqlite3_close(db);
+  }
   exit(1);
 }
 
-int getoption(int argc, char **argv, struct sockaddr_in *addr, int *time)
+// Initialize SQLite Database
+void init_db() {
+    int rc = sqlite3_open(db_file, &db);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "Cannot open database: %s\\n", sqlite3_errmsg(db));
+        sqlite3_close(db);
+        db = NULL; // Ensure db is NULL if open fails
+        error_exit("sqlite3_open");
+    }
+
+    const char *sql_create_table = 
+        "CREATE TABLE IF NOT EXISTS pending_data ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "message TEXT NOT NULL, "
+        "timestamp DATETIME DEFAULT CURRENT_TIMESTAMP);";
+    
+    char *err_msg = 0;
+    rc = sqlite3_exec(db, sql_create_table, 0, 0, &err_msg);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "Failed to create table: %s\\n", err_msg);
+        sqlite3_free(err_msg);
+        error_exit("sqlite3_exec create table");
+    }
+    printf("Database initialized and table 'pending_data' is ready.\\n");
+}
+
+// Store data into SQLite database
+void store_data_in_db(const char *message) {
+    if (!db) {
+        fprintf(stderr, "Database not initialized. Cannot store data.\\n");
+        return;
+    }
+    sqlite3_stmt *stmt;
+    const char *sql_insert = "INSERT INTO pending_data (message) VALUES (?);";
+    int rc = sqlite3_prepare_v2(db, sql_insert, -1, &stmt, 0);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "Failed to prepare statement: %s\\n", sqlite3_errmsg(db));
+        return;
+    }
+    sqlite3_bind_text(stmt, 1, message, -1, SQLITE_STATIC);
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_DONE) {
+        fprintf(stderr, "Failed to execute statement: %s\\n", sqlite3_errmsg(db));
+    } else {
+        printf("Data stored in DB: %s\\n", message);
+    }
+    sqlite3_finalize(stmt);
+}
+
+// Check if there is data in the database
+int is_dbdata(void) {
+    if (!db) {
+        fprintf(stderr, "Database not initialized. Cannot check for data.\\n");
+        return 0;
+    }
+    sqlite3_stmt *stmt;
+    const char *sql_count = "SELECT COUNT(*) FROM pending_data;";
+    int count = 0;
+    int rc = sqlite3_prepare_v2(db, sql_count, -1, &stmt, 0);
+    if (rc == SQLITE_OK) {
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            count = sqlite3_column_int(stmt, 0);
+        }
+    } else {
+        fprintf(stderr, "Failed to prepare count statement: %s\\n", sqlite3_errmsg(db));
+    }
+    sqlite3_finalize(stmt);
+    return count > 0;
+}
+
+// Send one piece of data from the database
+void send_dbdata(int skfd) {
+    if (!db) {
+        fprintf(stderr, "Database not initialized. Cannot send data.\\n");
+        return;
+    }
+    sqlite3_stmt *stmt_select;
+    const char *sql_select = "SELECT id, message FROM pending_data ORDER BY id ASC LIMIT 1;";
+    long data_id = -1;
+    const unsigned char *message = NULL;
+
+    int rc = sqlite3_prepare_v2(db, sql_select, -1, &stmt_select, 0);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "Failed to prepare select statement: %s\\n", sqlite3_errmsg(db));
+        return;
+    }
+
+    if (sqlite3_step(stmt_select) == SQLITE_ROW) {
+        data_id = sqlite3_column_int(stmt_select, 0);
+        message = sqlite3_column_text(stmt_select, 1);
+
+        if (message) {
+            printf("Sending DB data (ID: %ld): %s\\n", data_id, message);
+            ssize_t written_bytes = write(skfd, message, strlen((const char*)message));
+            if (written_bytes == -1) {
+                perror("send_dbdata: write failed");
+            } else if (written_bytes < (ssize_t)strlen((const char*)message)) {
+                fprintf(stderr, "send_dbdata: partial write, sent %zd of %zu bytes\\n", written_bytes, strlen((const char*)message));
+            } else {
+                printf("DB data (ID: %ld) sent successfully.\\n", data_id);
+                // Delete the sent record
+                sqlite3_stmt *stmt_delete;
+                const char *sql_delete = "DELETE FROM pending_data WHERE id = ?;";
+                rc = sqlite3_prepare_v2(db, sql_delete, -1, &stmt_delete, 0);
+                if (rc == SQLITE_OK) {
+                    sqlite3_bind_int(stmt_delete, 1, data_id);
+                    if (sqlite3_step(stmt_delete) != SQLITE_DONE) {
+                        fprintf(stderr, "Failed to delete record (ID: %ld): %s\\n", data_id, sqlite3_errmsg(db));
+                    } else {
+                        printf("Record (ID: %ld) deleted from DB.\\n", data_id);
+                    }
+                    sqlite3_finalize(stmt_delete);
+                } else {
+                    fprintf(stderr, "Failed to prepare delete statement: %s\\n", sqlite3_errmsg(db));
+                }
+            }
+        }
+    } else {
+        // No data found, or error in step
+         if (rc != SQLITE_DONE && rc != SQLITE_ROW) { // SQLITE_DONE means no rows, SQLITE_ROW means a row was found
+            fprintf(stderr, "Failed to step select statement: %s\\n", sqlite3_errmsg(db));
+        }
+    }
+    sqlite3_finalize(stmt_select);
+}
+
+
+int getoption(int argc, char **argv, struct sockaddr_in *addr, int *interval_time) // Renamed time to interval_time
 {
   int opt;
+  char *endptr;
+  long val;
+
   while ((opt = getopt(argc, argv, "p:a:ht:")) != -1)
   {
-    printf("opt: %c\n", opt);
+    printf("opt: %c\\n", opt);
     switch (opt)
     {
     case 'p':
-      addr->sin_port = htons(atoi(optarg));
+      val = strtol(optarg, &endptr, 10);
+      if (*endptr != '\\0' || val <= 0 || val > 65535) {
+        fprintf(stderr, "Invalid port number: %s\\n", optarg);
+        return -1;
+      }
+      addr->sin_port = htons((uint16_t)val);
       break;
     case 'a':
+      // Consider using inet_pton for better validation and IPv6 support if needed
+      if (inet_addr(optarg) == INADDR_NONE) {
+          fprintf(stderr, "Invalid address: %s\\n", optarg);
+          return -1;
+      }
       addr->sin_addr.s_addr = inet_addr(optarg);
       break;
     case 't':
-      *time = atoi(optarg);
+      val = strtol(optarg, &endptr, 10);
+      if (*endptr != '\\0' || val <= 0) { // Assuming time interval must be positive
+        fprintf(stderr, "Invalid time interval: %s\\n", optarg);
+        return -1;
+      }
+      *interval_time = (int)val;
       break;
     case '?':
     case ':':
@@ -75,6 +229,25 @@ int getoption(int argc, char **argv, struct sockaddr_in *addr, int *time)
 int socket_connect(struct sockaddr_in serveraddr)
 {
   int fd = -1;
+  if ((fd = socket(AF_INET, SOCK_STREAM, 0)) == -1)
+  {
+    perror("socket failure");
+    return -1;
+  }
+
+  if (connect(fd, (struct sockaddr *)&serveraddr, sizeof(serveraddr)) == -1)
+  {
+    perror("connect failed");
+    close(fd);
+    return -1;
+  }
+  return fd;
+}
+
+int socket_connect_noblock(struct sockaddr_in serveraddr)
+{
+
+  int fd = -1;
   int flags = -1;
   if ((fd = socket(AF_INET, SOCK_STREAM, 0)) == -1)
   {
@@ -82,7 +255,7 @@ int socket_connect(struct sockaddr_in serveraddr)
     return -1;
   }
 
-  // Get current flags
+  // 获取当前sockopt
   flags = fcntl(fd, F_GETFL, 0);
   if (flags == -1)
   {
@@ -91,7 +264,7 @@ int socket_connect(struct sockaddr_in serveraddr)
     return -1;
   }
 
-  // Set non-blocking
+  // 设置非阻塞
   if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1)
   {
     perror("fcntl F_SETFL O_NONBLOCK failed");
@@ -100,13 +273,12 @@ int socket_connect(struct sockaddr_in serveraddr)
   }
 
   int ret = connect(fd, (struct sockaddr *)&serveraddr, sizeof(serveraddr));
-  if (ret == 0)
+  if (ret == 0) // 立即成功（几率不大，常见于使用环回地址通信）
   {
-    // Connection successful immediately
-    // Restore blocking mode
+    // Successfully connected immediately, restore original flags
     if (fcntl(fd, F_SETFL, flags) == -1)
     {
-      perror("fcntl F_SETFL failed");
+      perror("fcntl F_SETFL failed to restore flags");
       close(fd);
       return -1;
     }
@@ -114,24 +286,17 @@ int socket_connect(struct sockaddr_in serveraddr)
   }
   else if (errno == EINPROGRESS)
   {
-    // Connection is in progress
-    // Restore blocking mode before returning -1 (as per user request to not close fd)
-    // Note: The prompt says "但不关闭fd" for EINPROGRESS and "在函数最后应改回阻塞socket"
-    // This implies even for EINPROGRESS, we should try to set it back to blocking.
-    // However, typically for EINPROGRESS, you'd keep it non-blocking and use select/poll/epoll.
-    // Given the specific instructions, I will set it back to blocking.
-    if (fcntl(fd, F_SETFL, flags) == -1) {
-        perror("fcntl F_SETFL failed while EINPROGRESS");
-        // If fcntl fails here, it's tricky. The socket is in an indeterminate state.
-        // Closing it might be safer, but the user said not to close on EINPROGRESS.
-        // For now, let's proceed as if fcntl succeeded, but this is a potential issue.
-    }
-    return -1; // Indicate connection in progress, fd not closed
+    // 连接操作正在进行中
+    // Do not restore flags here, caller should use select/poll to check for completion
+    // If fcntl fails here, it's an issue, but the primary path is to return fd for EINPROGRESS
+    // For simplicity in this example, we won't add fcntl error handling for EINPROGRESS path here
+    // as the socket is meant to be in non-blocking mode for connect to return EINPROGRESS.
+    return fd; // Return fd, caller must handle EINPROGRESS (e.g. with select/poll)
   }
   else if (errno == EISCONN)
   {
-    // Already connected (should not happen with a new socket, but handle defensively)
-    // Restore blocking mode
+    // 套接字已连接
+    // 恢复原始文件描述符标志 (通常为阻塞)
     if (fcntl(fd, F_SETFL, flags) == -1)
     {
       perror("fcntl F_SETFL failed");
@@ -142,129 +307,170 @@ int socket_connect(struct sockaddr_in serveraddr)
   }
   else
   {
-    // Other connect error
-    perror("connect failed");
+    // 其他连接错误
+    perror("connect failed (non-blocking)");
     close(fd);
     return -1;
   }
-  // This part of the original code is now integrated above.
-  // The final fcntl to restore blocking mode is handled in each success/EINPROGRESS path.
 }
 
-/*
-  if (connect(fd, (struct sockaddr *)&serveraddr, sizeof(serveraddr)))
-  {
-    perror("connect failed");
-    close(fd);
-    return -1;
-  }
-  return fd;
-  if (fcntl(fd, F_SETFL, flag | O_NONBLOCK) == -1)
-  {
-    perror("fcntl failed");
-    close(fd);
-    return -1;
-  }
-  if (connect(fd, (struct sockaddr *)&serveraddr, sizeof(serveraddr)) == -1 && errno != EISCONN)
-  {
-    if (errno != EINPROGRESS)
-    {
-      perror("connect failed");
-      close(fd);
-      return -1;
-    }
-    else
-    {
-      perror("connect failed");
-      return -1;
-    }
-  }
-  
-}
-*/
 
 void get_data(char *buffer, size_t size)
 {
   char *ptr;
-  int id = 1;
-  int fd;
-  char buf[128] = {0};
+  int id = 1; // This id is just for the string, DB will have its own auto-increment id
+  int sensor_fd; // Renamed to avoid confusion
+  char sensor_buf[256] = {0}; // Increased buffer size
   float temp;
-  fd = open("/sys/bus/w1/devices/28-2402000318f9/w1_slave", O_RDONLY);
-  read(fd, buf, sizeof(buf));
-  ptr = strstr(buf, "t=");
-  temp = (atof(ptr + 2) / 1000);
-  time_t now = time(NULL);
+
+  sensor_fd = open("/sys/bus/w1/devices/28-2402000318f9/w1_slave", O_RDONLY);
+  if (sensor_fd == -1) {
+      perror("get_data: open w1_slave failed");
+      snprintf(buffer, size, "[id: %02d | ERROR] failed to open sensor", id);
+      return;
+  }
+
+  ssize_t bytes_read = read(sensor_fd, sensor_buf, sizeof(sensor_buf) -1);
+  close(sensor_fd);
+
+  if (bytes_read <= 0) {
+      perror("get_data: read w1_slave failed or empty");
+      snprintf(buffer, size, "[id: %02d | ERROR] failed to read sensor", id);
+      return;
+  }
+  sensor_buf[bytes_read] = '\\0'; // Null-terminate the buffer
+
+  ptr = strstr(sensor_buf, "t=");
+  if (ptr == NULL) {
+      fprintf(stderr, "get_data: Could not find 't=' in sensor data: %s\\n", sensor_buf);
+      snprintf(buffer, size, "[id: %02d | ERROR] invalid sensor data format", id);
+      return;
+  }
+
+  // atof error checking is limited; it returns 0.0 on error.
+  // For more robust parsing, consider strtod.
+  temp = (atof(ptr + 2) / 1000.0); 
+
+  time_t current_time_val; // Renamed to avoid conflict
   struct tm tm_info;
-  localtime_r(&now, &tm_info);
+  
+  if (time(&current_time_val) == (time_t)-1) {
+      perror("get_data: time() failed");
+      snprintf(buffer, size, "[id: %02d | ERROR] failed to get current time", id);
+      return;
+  }
+  
+  if (localtime_r(&current_time_val, &tm_info) == NULL) {
+      perror("get_data: localtime_r failed");
+      snprintf(buffer, size, "[id: %02d | ERROR] failed to convert time", id);
+      return;
+  }
+  
   char time_string[128];
-  strftime(time_string, sizeof(time_string), "%c", &tm_info);
-  snprintf(buffer, size, "[id: %02d | %s] tempreture: %.3f", id, time_string, temp);
+  strftime(time_string, sizeof(time_string), "%c", &tm_info); // %c is locale-dependent
+  snprintf(buffer, size, "[id: %02d | %s] temperature: %.3f", id, time_string, temp);
 }
 
 int main(int argc, char **argv)
 {
   int skfd = -1;
-  int rv = -1;
-  int time = 30;
-  struct timespec last, now;
+  // int rv = -1; // rv is declared later inside the loop
+  int interval_time = 30; // Renamed from 'time'
+  struct timespec last, now_ts; // Renamed 'now' to 'now_ts' to avoid conflict
   struct sockaddr_in serveraddr;
-  sockaddr_init(&serveraddr);
-  getoption(argc, argv, &serveraddr, &time);
-  printf("完成参数解析\n");
-  printf("time: %d\n", time);
+
+  sockaddr_init(&serveraddr); // Initialize with defaults
+  if (getoption(argc, argv, &serveraddr, &interval_time) == -1) {
+      fprintf(stderr, "Failed to parse options. Exiting.\\n");
+      exit(1); // No need for error_exit if DB not initialized
+  }
+  
+  init_db(); // Initialize the database
+
+  printf("完成参数解析\\n");
+  printf("Interval time: %d seconds\\n", interval_time);
+  printf("Server Address: %s, Port: %d\\n", inet_ntoa(serveraddr.sin_addr), ntohs(serveraddr.sin_port));
+
+
   if ((skfd = socket_connect(serveraddr)) == -1)
   {
-    perror("socket connect failed");
-    error_exit();
+    // perror("socket connect failed"); // socket_connect already calls perror
+    error_exit("initial socket_connect failed");
   }
-  printf("skfd: %d\n", skfd);
+  printf("Connected to server. skfd: %d\\n", skfd);
+
   if ((clock_gettime(CLOCK_MONOTONIC_RAW, &last)) == -1)
   {
-    perror("clock failed");
-    error_exit();
+    error_exit("clock_gettime (last) failed");
   }
+
   while (1)
   {
-    int rv;
-    char buf[128] = {0};
-    if ((clock_gettime(CLOCK_MONOTONIC_RAW, &now)) == -1)
+    int connection_status;
+    char data_buf[256] = {0}; // Buffer for get_data
+
+    if ((clock_gettime(CLOCK_MONOTONIC_RAW, &now_ts)) == -1)
     {
-      perror("clock failed");
-      error_exit();
+      perror("clock_gettime (now_ts) failed in loop");
+      // Decide if this is fatal or if we should try to continue
+      sleep(1); // Sleep a bit before retrying or exiting
+      continue; // Or error_exit("...");
     }
 
-    if (((now.tv_sec - last.tv_sec) * 1000000000L + (now.tv_nsec - last.tv_nsec)) >= time * 1000000000L)
+    if (((now_ts.tv_sec - last.tv_sec) * 1000000000L + (now_ts.tv_nsec - last.tv_nsec)) >= (long)interval_time * 1000000000L)
     {
-      get_data(buf, sizeof(buf));
-      printf("getdata:%s\n", buf);
-      last = now;
-    }
-    rv = is_connected(skfd);
-    if (rv == 1)
-    {
-      if (write(skfd, buf, sizeof(buf)) == -1)
-      {
-        perror("write failed");
-        close(skfd);
-        error_exit();
+      get_data(data_buf, sizeof(data_buf));
+      printf("getdata raw: %s\\n", data_buf);
+      if (strstr(data_buf, "ERROR") == NULL) { // Only store valid data
+          store_data_in_db(data_buf);
+      } else {
+          printf("Skipping storage of erroneous data: %s\\n", data_buf);
       }
+      last = now_ts;
+    }
+
+    connection_status = is_connected(skfd);
+    if (connection_status == 1)
+    {
+      // No direct write here anymore, send_dbdata handles it
       if (is_dbdata())
       {
-        send_dbdata();
+        send_dbdata(skfd);
       }
     }
     else
     {
-      printf("connection closed\n");
-      close(skfd);
-      skfd = -1;
-      printf("reconnect\n");
-      if ((skfd = socket_connect(serveraddr)) == -1)
-      {
-        continue;
+      printf("Connection lost or skfd invalid (%d).\\n", skfd);
+      if (skfd != -1) {
+          close(skfd);
+          skfd = -1;
+      }
+      
+      printf("Attempting to reconnect...\\n");
+      // For non-blocking connect, we'd need to use select/poll to check status after EINPROGRESS
+      // For simplicity, let's try a blocking reconnect here or a delayed non-blocking.
+      // skfd = socket_connect_noblock(serveraddr);
+      // if (skfd == -1 && errno == EINPROGRESS) {
+      //    printf("Reconnect in progress... will check next cycle or use select/poll.\\n");
+      //    // Need a mechanism to complete this connection (e.g. select in a more complex loop)
+      // } else 
+      skfd = socket_connect(serveraddr); // Try blocking connect for simplicity in reconnect
+      if (skfd == -1) {
+        perror("Reconnect attempt failed");
+        printf("Will retry connection later.\\n");
+        sleep(5); // Wait before trying to reconnect again in the loop
+      } else {
+        printf("Reconnected successfully. New skfd: %d\\n", skfd);
       }
     }
-    return 0;
+    usleep(100000); // Sleep for 100ms to reduce CPU usage
   }
+
+  if (db) {
+    sqlite3_close(db);
+  }
+  if (skfd != -1) {
+      close(skfd);
+  }
+  return 0; // Should not be reached in normal operation due to while(1)
 }
