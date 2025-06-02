@@ -9,3 +9,6 @@
 #include <arpa/inet.h>
 #include <string.h>
 #include <stdlib.h>
+#include <errno.h>
+
+#include "sqlite3.h"
